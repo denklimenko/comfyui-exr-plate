@@ -22,7 +22,11 @@ import json as _json
 import re
 import uuid as _uuid
 import gc
-
+import numpy as np
+import torch
+import cv2
+import OpenEXR
+import Imath
 try:
     from urllib.request import Request as _Request, urlopen as _urlopen
 except ImportError:
@@ -32,11 +36,6 @@ try:
     import folder_paths  # ComfyUI runtime
 except ImportError:
     folder_paths = None
-
-import cv2
-import numpy as np
-import torch
-
 
 # ---------------------------------------------------------------------------
 # Transfer functions (match Nuke's sRGB / rec709 colorspaces)
@@ -168,7 +167,7 @@ def _resolve_frames(path, first_frame, last_frame):
         raise FileNotFoundError("No frames match: {}".format(glob_pat))
     return files
 
-
+'''
 def _read_exr(filepath):
     img = cv2.imread(filepath, cv2.IMREAD_UNCHANGED | cv2.IMREAD_ANYDEPTH)
     if img is None:
@@ -183,7 +182,137 @@ def _read_exr(filepath):
         return img[:, :, 2::-1].copy(), img[:, :, 3].copy()
     raise IOError("Unsupported channel count {} in {}".format(
         img.shape[2], filepath))
+'''
+def _read_exr(filepath):
+    try:
+        exr_file = OpenEXR.InputFile(filepath)
+        header = exr_file.header()
 
+        data_window = header["dataWindow"]
+        width = data_window.max.x - data_window.min.x + 1
+        height = data_window.max.y - data_window.min.y + 1
+
+        available_channels = list(header["channels"].keys())
+        if not available_channels:
+            raise ValueError("EXR file contains no image channels")
+
+        float_type = Imath.PixelType(Imath.PixelType.FLOAT)
+
+        def read_channel(channel_name):
+            raw = exr_file.channel(channel_name, float_type)
+            return np.frombuffer(raw, dtype=np.float32).reshape(height, width)
+
+        rgb = None
+        alpha = None
+
+        # Standard RGB or RGBA plate.
+        if all(name in available_channels for name in ("R", "G", "B")):
+            rgb = np.stack(
+                [
+                    read_channel("R"),
+                    read_channel("G"),
+                    read_channel("B"),
+                ],
+                axis=2,
+            )
+
+            if "A" in available_channels:
+                alpha = read_channel("A")
+
+        # Luminance/chroma EXR, often used for grayscale or YCbCr-like data.
+        elif "Y" in available_channels:
+            luminance = read_channel("Y")
+            rgb = np.stack([luminance, luminance, luminance], axis=2)
+
+            if "A" in available_channels:
+                alpha = read_channel("A")
+
+        # Single-channel EXR, such as a depth, matte, or cryptomatte layer.
+        elif available_channels:
+            first_channel = available_channels[0]
+            channel = read_channel(first_channel)
+            rgb = np.stack([channel, channel, channel], axis=2)
+
+        if rgb is None:
+            raise ValueError(
+                "Could not interpret EXR channels: {}".format(available_channels)
+            )
+
+        if alpha is None:
+            alpha = np.ones((height, width), dtype=np.float32)
+
+        exr_file.close()
+        return rgb.astype(np.float32), alpha.astype(np.float32)
+
+    except Exception as exr_error:
+        img = cv2.imread(
+            filepath,
+            cv2.IMREAD_UNCHANGED | cv2.IMREAD_ANYDEPTH,
+        )
+
+        if img is None:
+            raise IOError(
+                "OpenCV failed to read: {} ({})".format(filepath, exr_error)
+            )
+
+        if img.ndim == 2:
+            rgb = cv2.cvtColor(img, cv2.COLOR_GRAY2RGB)
+            alpha = np.ones(img.shape[:2], dtype=np.float32)
+        else:
+            if img.shape[2] == 4:
+                rgb = img[:, :, :3]
+                alpha = img[:, :, 3]
+            else:
+                rgb = img
+                alpha = np.ones(img.shape[:2], dtype=np.float32)
+
+            rgb = cv2.cvtColor(rgb, cv2.COLOR_BGR2RGB)
+
+        return rgb.astype(np.float32), alpha.astype(np.float32)
+
+# additional function added
+def _write_exr(filepath, rgb, alpha=None, half=True):
+    rgb = np.asarray(rgb, dtype=np.float32)
+
+    if rgb.ndim == 2:
+        rgb = np.stack([rgb, rgb, rgb], axis=2)
+
+    if rgb.shape[2] == 4:
+        alpha = rgb[:, :, 3]
+        rgb = rgb[:, :, :3]
+
+    if rgb.shape[2] != 3:
+        raise ValueError(
+            "Expected an RGB image with 3 channels, got shape {}".format(rgb.shape)
+        )
+
+    height, width = rgb.shape[:2]
+
+# B and R channels order swapped
+    channels = {
+        "B": np.ascontiguousarray(rgb[:, :, 0]),
+        "G": np.ascontiguousarray(rgb[:, :, 1]),
+        "R": np.ascontiguousarray(rgb[:, :, 2]),
+    }
+
+    if alpha is not None:
+        channels["A"] = np.ascontiguousarray(
+            np.asarray(alpha, dtype=np.float32).reshape(height, width)
+        )
+
+    if half:
+        for name in channels:
+            channels[name] = channels[name].astype(np.float16)
+
+    header = {
+        "compression": OpenEXR.ZIP_COMPRESSION,
+        "type": OpenEXR.scanlineimage,
+    }
+
+    with OpenEXR.File(header, channels) as output_file:
+        output_file.write(filepath)
+
+    return filepath
 
 def _target_size(src_w, src_h, custom_w, custom_h):
     """VHS-style: 0 = keep. One value set -> keep aspect."""
@@ -494,9 +623,21 @@ class SaveEXRPlate:
             # exr stays float32
 
             fpath = (pattern % (first_frame + i)) if pattern else path
-            if not cv2.imwrite(fpath, np.ascontiguousarray(out), params):
-                raise IOError("Failed to write: {}".format(fpath))
-            written.append(fpath)
+            try:
+                written = _write_exr(
+                    fpath,
+                    out,
+                    alpha=alpha,
+                    half=(bit_depth == "half (16-bit)"),
+                )
+            except Exception as write_error:
+                raise IOError(
+                    "Failed to write EXR: {} ({})".format(fpath, write_error)
+                )
+            #if not cv2.imwrite(fpath, np.ascontiguousarray(out), params):
+            #    raise IOError("Failed to write: {}".format(fpath))
+            
+            #written.append(fpath)
 
         if send_to_nuke and _urlopen is not None:
             try:
